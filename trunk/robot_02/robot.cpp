@@ -5,9 +5,13 @@
 //#include "WiFly.h"
 
 
-// Ultrasonic pins
+// Ultrasonic sensors pins
 #define USENSOR1 44
 #define USENSOR2 45
+
+// Servo pins
+const int USERVO = 3;
+
 
 // Motors pins
 #define MOTOR_FL_POWER 7
@@ -31,17 +35,11 @@
 #define MOTOR_RR_DIRECTION 25
 
 // Compass pins
-#define COMPASS_SDA 4
-#define COMPASS_SCL 5
 const int HMC6352Address = 0x42;
 // Shift the device's documented slave address (0x42) 1 bit right
 // This compensates for how the TWI library only wants the
 // 7 most significant bits (with the high bit padded with 0)
 const int HMC6352SlaveAddress = HMC6352Address >> 1; // This results in 0x21 as the address to pass to TWI
-
-// Servo pins
-const int USERVO = 3;
-
 
 
 
@@ -51,22 +49,21 @@ const int USERVO = 3;
 /*
  * Method declarations.
  */
-void updateRobotOrientation(bool outputToSerial);
-void updateRanges(bool outputToSerial);
+void updateRobotOrientation();
+void updateRanges();
 void updateSingleRange(int heading, int range);
 int roundToFactor(int value, int roundFactor);
 void robotForward(int time, int speed);
 void robotBackward(int time, int speed);
-void robotTurn(int heading, bool outputToSerial);
+void robotTurn();
 void robotStop();
-void moveRobot(bool outputToSerial);
+void robotMove();
 void choosePath(bool forceNew);
-bool preventColisions();
-void correctCourse();
+void preventColisions();
 int getDistanceForHeading(int heading);
 int getCurrentRoundedHeading();
 void takeHttpRequest();
-
+void robotBackupAndChooseAnotherPath();
 
 
 
@@ -88,19 +85,33 @@ const int MIN_DISTANCE_BUFFER = 12;
  */
 const int MIN_DISTANCE_BUFFER_DIAG = 10;
 
+/*
+ * A multiplication applied to MIN_DISTANCE_BUFFER_*
+ * when choosing new paths. This allows the robot to pick better
+ * paths and prevent it from choosing a path which might be onstructed.
+ * A value of 1.3 to 1.5 is ok.
+ */
+const double MIN_DISTANCE_FACTOR = 1.5;
+
 /**
  * Speed, between 1 and 254, at which to move forward.
  */
-const int CRUISE_SPEED = 200;
+const int CRUISE_SPEED = 150;
 
 /**
  * This is the speed at which the robot performs course correction
  * tasks, like correcting its heading or simply turning. It must be a value
  * between 1 and 254.
  */
-const int COURSE_CORRECTION_SPEED = 150;
+const int COURSE_CORRECTION_SPEED = 100;
 
-const int COURSE_CORRECTION_NB_ATTEMPTS = 3;
+/**
+ * Time spent trying to correct the course of the robot.
+ * after the given time interval, in miliseconds, the robot
+ * will stop trying to correct the course and back up a little,
+ * then choose some other direction.
+ */
+const int COURSE_CORRECTION_TIME = 20000;
 
 /**
  * This is the number of ultranosic scan samples to use when averaging the
@@ -108,7 +119,14 @@ const int COURSE_CORRECTION_NB_ATTEMPTS = 3;
  * does X scans in each direction and averages the results, thus reducing
  * the noise.
  */
-const int USENS_NBSAMPLES = 2;
+const int USENS_NBSAMPLES = 5;
+
+/**
+ * This is the number of compass scan samples to use when averaging the
+ * heading measurements. In order to have better accuracy, the robot always
+ * does X scans, thus reducing the noise.
+ */
+const int COMPASS_NBSAMPLES = 3;
 
 
 
@@ -142,7 +160,7 @@ int currentDirection = 0;
  */
 int currentOrientation = 0;
 
-int nbCourseCorrectionAttempts = 0;
+unsigned long courseCorrectionTimestamp = millis();
 
 /**
  * Sensors servo object
@@ -190,9 +208,6 @@ void setup() {
 	pinMode(MOTOR_FR_POWER, OUTPUT);
 	pinMode(MOTOR_RR_POWER, OUTPUT);
 
-	pinMode(COMPASS_SDA, INPUT);
-	pinMode(COMPASS_SCL, INPUT);
-
 	uSensorServo.attach(USERVO);
 	pinMode(USENSOR1, INPUT);
 	pinMode(USENSOR2, INPUT);
@@ -208,7 +223,7 @@ void setup() {
 	Wire.begin();
 
 	// Update the orientation
-	updateRobotOrientation(ENABLE_SERIAL_DEBUG);
+	updateRobotOrientation();
 
 	// Position the servo to his start position
 	uSensorServo.write(0);
@@ -221,8 +236,10 @@ void setup() {
 //	server.begin();
 
 	for (int i = 0; i < 4; i++) {
-		updateRanges(ENABLE_SERIAL_DEBUG);
+		updateRanges();
 	}
+
+	choosePath(false);
 }
 
 void loop() {
@@ -232,62 +249,70 @@ void loop() {
 	}
 
     // Update the polar heading
-	updateRobotOrientation(ENABLE_SERIAL_DEBUG);
+	updateRobotOrientation();
 
 	// Update the ranges
 	if (currentMotorState == MOTOR_FORWARD) {
-		updateRanges(ENABLE_SERIAL_DEBUG);
+		updateRanges();
 	}
 
 	// take any HTTP requests.
 	//takeHttpRequest();
 
 	// go.
-	moveRobot(ENABLE_SERIAL_DEBUG);
+	robotMove();
+
+	if (ENABLE_SERIAL_DEBUG) {
+		// throttle a bit.
+		delay(1000);
+	}
 }
 
 /**
  * Updates the current heading of the robot in degrees relative
  * to Earth's north.
- *
- * outputToSerial -> writes to the serial port the current orientation
- * once it's resolved
  */
-void updateRobotOrientation(bool outputToSerial) {
+void updateRobotOrientation() {
 
-	byte headingData[2];
+	unsigned long orientationsSum = 0;
 
-	// Send a "A" command to the HMC6352
-	// This requests the current heading data
-	Wire.beginTransmission(HMC6352SlaveAddress);
-	Wire.send('A'); // The "Get Data" command
-	Wire.endTransmission();
+	for (int i = 0; i < COMPASS_NBSAMPLES; i++) {
 
-	delay(10); // The HMC6352 needs at least a 70us (microsecond) delay
-	// after this command.  Using 10ms just makes it safe
-	// Read the 2 heading bytes, MSB first
-	// The resulting 16bit word is the compass heading in 10th's of a degree
-	// For example: a heading of 1345 would be 134.5 degrees
+		byte headingData[2];
 
-	Wire.requestFrom(HMC6352SlaveAddress, 2); // Request the 2 byte heading (MSB comes first)
+		// Send a "A" command to the HMC6352
+		// This requests the current heading data
+		Wire.beginTransmission(HMC6352SlaveAddress);
+		Wire.send('A'); // The "Get Data" command
+		Wire.endTransmission();
 
-	int i = 0;
-	while (Wire.available() && i < 2) {
-		headingData[i] = Wire.receive();
-		i++;
+		delay(10); // The HMC6352 needs at least a 70us (microsecond) delay
+		// after this command.  Using 10ms just makes it safe
+		// Read the 2 heading bytes, MSB first
+		// The resulting 16bit word is the compass heading in 10th's of a degree
+		// For example: a heading of 1345 would be 134.5 degrees
+
+		Wire.requestFrom(HMC6352SlaveAddress, 2); // Request the 2 byte heading (MSB comes first)
+
+		int i = 0;
+		while (Wire.available() && i < 2) {
+			headingData[i] = Wire.receive();
+			i++;
+		}
+
+		orientationsSum += (headingData[0] * 256 + headingData[1]) / 10; // Put the MSB and LSB together
+
+		delay(50);
 	}
 
-	currentOrientation = (headingData[0] * 256 + headingData[1]) / 10; // Put the MSB and LSB together
+	currentOrientation = orientationsSum / COMPASS_NBSAMPLES;
 
-
-	if (outputToSerial) {
+	if (ENABLE_SERIAL_DEBUG) {
 		Serial.println("************************ updateRobotOrientation");
 		Serial.print("Current heading: ");
 		Serial.print(currentOrientation);
 		Serial.println(" degrees");
 	}
-
-	delay(50);
 }
 
 
@@ -298,7 +323,7 @@ void updateRobotOrientation(bool outputToSerial) {
  * the ranges, then updating the map itself by accounting
  * for the polar heading of the robot.
  */
-void updateRanges(bool outputToSerial) {
+void updateRanges() {
 
 	// If the robot is going forward, we scan:
 	// front, front left and front right.
@@ -348,7 +373,7 @@ void updateRanges(bool outputToSerial) {
 			targetServoOffset = -135;
 		}
 	}
-	if (outputToSerial) {
+	if (ENABLE_SERIAL_DEBUG) {
 		Serial.println("************************ updateRanges");
 		Serial.print("Current servo position is:");
 		Serial.println(uServoPosition);
@@ -374,7 +399,7 @@ void updateRanges(bool outputToSerial) {
 		delay(100);
 	}
 
-	if (outputToSerial) {
+	if (ENABLE_SERIAL_DEBUG) {
 		Serial.println("************************ updateRanges");
 		Serial.print("Servo position now is:");
 		Serial.println(uServoPosition);
@@ -411,7 +436,7 @@ void updateRanges(bool outputToSerial) {
 			return;
 	}
 
-	if (outputToSerial) {
+	if (ENABLE_SERIAL_DEBUG) {
 		int polarHeading1;
 		int polarHeading2;
 		if (currentOrientation + sensor1Heading >= 360) {
@@ -445,7 +470,6 @@ void updateRanges(bool outputToSerial) {
 //	int avgPing = pingSum / USENS_NBSAMPLES;
 	for (int i = 0; i < USENS_NBSAMPLES; i++) {
 		pingSum += pulseIn(USENSOR1, HIGH);
-		delay (1);
 	}
 	int avgPing = pingSum / USENS_NBSAMPLES / 147;
 
@@ -465,7 +489,6 @@ void updateRanges(bool outputToSerial) {
 //	avgPing = pingSum / USENS_NBSAMPLES;
 	for (int i = 0; i < USENS_NBSAMPLES; i++) {
 		pingSum += pulseIn(USENSOR2, HIGH);
-		delay (1);
 	}
 	avgPing = pingSum / USENS_NBSAMPLES / 147;
 
@@ -476,7 +499,7 @@ void updateRanges(bool outputToSerial) {
 	/*
 	 * Debug
 	 */
-	if (outputToSerial) {
+	if (ENABLE_SERIAL_DEBUG) {
 		Serial.println("***************************** updateRanges");
 
 		Serial.print("\t\t");
@@ -666,48 +689,65 @@ void robotStop() {
  * heading: 0-359 polar heading to stop at.
  * speed: 1-255 speed.
  */
-void robotTurn(int heading, bool outputToSerial) {
+void robotTurn() {
 
-	// Update the current polar heading
-	updateRobotOrientation(outputToSerial);
-
-	// Round the target and the current heading
-	// to a precision scale of 45.
-	int roundedTargetHeading =
-		roundToFactor(heading, 45);
-	if (roundedTargetHeading == 360) {
-		roundedTargetHeading = 0;
-	}
 	int roundedCurrentHeading = getCurrentRoundedHeading();
 
-	if (outputToSerial) {
+	if (ENABLE_SERIAL_DEBUG) {
 		Serial.println("********************************** robotTurn");
 		Serial.print("Rounded Current Heading : ");
 		Serial.println(roundedCurrentHeading);
 		Serial.print("Rounded Target Heading : ");
-		Serial.println(roundedTargetHeading);
+		Serial.println(currentDirection);
 	}
 
 	// Check if the heading is already attained.
-	if (roundedCurrentHeading == roundedTargetHeading) {
-		robotStop();
+	// Check if we are in the right direction.
+	unsigned long newTimestamp = millis();
+	if (newTimestamp < courseCorrectionTimestamp) {
+		// value has overflown.
+		courseCorrectionTimestamp = newTimestamp;
+		// we can leave early.
 		return;
 	}
+
+	if (roundedCurrentHeading == currentDirection) {
+		courseCorrectionTimestamp = newTimestamp;
+		if (currentMotorState != MOTOR_FORWARD) {
+			robotStop();
+		}
+		return;
+	}
+
+	if (newTimestamp - courseCorrectionTimestamp >= COURSE_CORRECTION_TIME
+		&& (currentMotorState == MOTOR_LEFT || currentMotorState == MOTOR_RIGHT))
+	{
+		// Abort. We're stuck.
+		if (ENABLE_SERIAL_DEBUG) {
+			Serial.println("************************ robotTurn");
+			Serial.print("Aborting course correction after trying for ");
+			Serial.print(COURSE_CORRECTION_TIME);
+			Serial.println(" millis.");
+		}
+		robotBackupAndChooseAnotherPath();
+		courseCorrectionTimestamp = newTimestamp;
+	}
+
 
 	// Start turning
 
 	// Figure out the shortest turn. Left or right.
 	// 0-> left, 1->right
 	int direction;
-	if (roundedCurrentHeading < roundedTargetHeading) {
-		int diff = roundedTargetHeading - roundedCurrentHeading;
+	if (roundedCurrentHeading < currentDirection) {
+		int diff = currentDirection - roundedCurrentHeading;
 		if (diff > 180) {
 			direction = 0;
 		} else {
 			direction = 1;
 		}
 	} else {
-		int diff = roundedCurrentHeading - roundedTargetHeading;
+		int diff = roundedCurrentHeading - currentDirection;
 		if (diff > 180) {
 			direction = 1;
 		} else {
@@ -717,10 +757,10 @@ void robotTurn(int heading, bool outputToSerial) {
 
 	if (direction == 0) {
 		if (currentMotorState != MOTOR_LEFT) {
-			if (outputToSerial) {
+			if (ENABLE_SERIAL_DEBUG) {
 				Serial.println("************************ robotTurn");
 				Serial.print("Turning left to heading:");
-				Serial.println(roundedTargetHeading);
+				Serial.println(currentDirection);
 				Serial.print("Current heading:");
 				Serial.println(roundedCurrentHeading);
 			}
@@ -736,10 +776,10 @@ void robotTurn(int heading, bool outputToSerial) {
 		}
 	} else {
 		if (currentMotorState != MOTOR_RIGHT) {
-			if (outputToSerial) {
+			if (ENABLE_SERIAL_DEBUG) {
 				Serial.println("************************ robotTurn");
 				Serial.print("Turning right to heading:");
-				Serial.println(roundedTargetHeading);
+				Serial.println(currentDirection);
 				Serial.print("Current heading:");
 				Serial.println(roundedCurrentHeading);
 			}
@@ -769,44 +809,25 @@ int getCurrentRoundedHeading() {
 
 
 
-void moveRobot(bool outputToSerial) {
-
-	bool forceNewPath = false;
+/**
+ * This is the main logic of the robot's movements.
+ */
+void robotMove() {
 
 	// prevent collisions.
-	if (preventColisions() == false) {
+	preventColisions();
 
-		if (outputToSerial) {
-			Serial.println("************************ moveRobot");
-			Serial.println("Changing course. Collision detected.");
-		}
-
-		// stop now!
-		robotStop();
-
-
-		// back up a little
-		robotBackward(1000, COURSE_CORRECTION_SPEED);
-
-		forceNewPath = true;
-	}
-
-	// correct the course.
-	correctCourse();
-
-	if (currentMotorState == MOTOR_LEFT || currentMotorState == MOTOR_RIGHT) {
-		robotTurn(currentDirection, outputToSerial);
-	}
+	robotTurn();
 
 	// Nothing fancy to do. Just go forward
 	// if we're stopped.
 	if (currentMotorState == MOTOR_STOPPED) {
 
-		choosePath(forceNewPath);
+		choosePath(false);
 
-		robotTurn(currentDirection, outputToSerial);
+		robotTurn();
 
-		if (outputToSerial) {
+		if (ENABLE_SERIAL_DEBUG) {
 			Serial.println("************************ moveRobot");
 			Serial.println("All good. Going forward.");
 		}
@@ -816,63 +837,62 @@ void moveRobot(bool outputToSerial) {
 }
 
 
-
-
-
-
-
-
-
 /**
  * Chooses a new direction to go to.
- * forceNewDirection: Forces the choice to be different
- * significantly from the last direction.
+ * forceNew: Forces the choice to be slightly different
+ * from the last direction, because we suspect something is in our way.
  */
 void choosePath(bool forceNew) {
 
-	if (forceNew) {
-		for (int i = 0; i < 4; i++) {
-			updateRanges(ENABLE_SERIAL_DEBUG);
-		}
-	}
-
 	// The best choice is either full ahead, diag left or diag right.
 	int bestChoice = -1;
-	int bestChoiceValue = -1;
-	// The second best choice is wherever there is the greatest distance.
-	int secondBestChoice = -1;
-	int secondBestChoiceValue = -1;
+	int bestChoiceValue = 999;
 
 	for (int i = 0; i < 360; i += 45) {
+		int turnDiff = currentDirection - i;
+		if (turnDiff < 0) {
+			turnDiff = i - currentDirection;
+		}
+
+		if (forceNew && turnDiff <= 90) {
+			continue;
+		}
+
+		int curLeft = currentDirection - 45;
+		if (curLeft < 0) {
+			curLeft += 360;
+		}
+		int curRight = currentDirection + 45;
+		if (curRight >= 360) {
+			curRight -= 360;
+		}
+
 		int curDist = getDistanceForHeading(i);
-		if (curDist >= MIN_DISTANCE_BUFFER) {
-			int leftDiag = currentDirection - 45;
-			if (leftDiag < 0) {
-				leftDiag = 360 - leftDiag;
-			}
-			int rightDiag = currentDirection + 45;
-			if (rightDiag >= 360) {
-				rightDiag = rightDiag - 360;
-			}
-			if (curDist > bestChoiceValue &&
-				((i == currentDirection && forceNew == false)
-				|| i == leftDiag
-				|| i == rightDiag))
-			{
+		int curDistLeft = getDistanceForHeading(curLeft);
+		int curDistRight = getDistanceForHeading(curRight);
+
+		if (curDist >= (MIN_DISTANCE_BUFFER * MIN_DISTANCE_FACTOR)
+			&& curDistLeft >= (MIN_DISTANCE_BUFFER_DIAG * MIN_DISTANCE_FACTOR)
+			&& curDistRight >= (MIN_DISTANCE_BUFFER_DIAG * MIN_DISTANCE_FACTOR))
+		{
+			if (turnDiff < bestChoiceValue) {
+				bestChoiceValue = turnDiff;
 				bestChoice = i;
-				bestChoiceValue = curDist;
-			}
-			if (curDist > secondBestChoiceValue) {
-				secondBestChoice = i;
-				secondBestChoiceValue = curDist;
 			}
 		}
 	}
 
-	if (bestChoice >= 0 && forceNew == false) {
+	if (ENABLE_SERIAL_DEBUG) {
+		Serial.println("************************ choosePath");
+		Serial.println("Path chosen.");
+		Serial.print("Best heading: ");
+		Serial.println(bestChoice);
+		Serial.print("Best heading turn difference: ");
+		Serial.println(bestChoiceValue);
+	}
+
+	if (bestChoice >= 0) {
 		currentDirection = bestChoice;
-	} else if (secondBestChoice >= 0) {
-		currentDirection = secondBestChoice;
 	} else {
 		// This is a problem. It can happen when all directions are
 		// perceived as having an obstacle. Just move backward.... whatever.
@@ -891,17 +911,25 @@ void choosePath(bool forceNew) {
 /**
  * Checks if something is blocking the robot from going where
  * it intends to.
- * Returns true if everything is ok, false if the way is blocked.
+ * Returns true if a problem was detected.
  */
-bool preventColisions() {
+void preventColisions() {
 
 	if (currentMotorState != MOTOR_FORWARD) {
-		return true;
+		return;
 	}
 
 	// Check straight ahead
 	if (getDistanceForHeading(currentDirection) <= MIN_DISTANCE_BUFFER) {
-		return false;
+		if (ENABLE_SERIAL_DEBUG) {
+			Serial.println("************************ movepreventColisions");
+			Serial.println("Changing course. Collision detected ahead.");
+		}
+
+		robotBackupAndChooseAnotherPath();
+
+		// We can leave early.
+		return;
 	}
 
 	// Check diagonals forward
@@ -915,49 +943,30 @@ bool preventColisions() {
 	}
 
 	if (getDistanceForHeading(leftDiag) <= MIN_DISTANCE_BUFFER_DIAG
-			|| getDistanceForHeading(rightDiag) <= MIN_DISTANCE_BUFFER_DIAG) {
-		return false;
+			|| getDistanceForHeading(rightDiag) <= MIN_DISTANCE_BUFFER_DIAG)
+	{
+		robotBackupAndChooseAnotherPath();
+	}
+}
+
+void robotBackupAndChooseAnotherPath() {
+	// stop now!
+	robotStop();
+
+	// back up a little
+	robotBackward(500, COURSE_CORRECTION_SPEED);
+
+	// Scan the area.
+	for (int i = 0; i < 4; i++) {
+		updateRanges();
 	}
 
-	return true;
+	// Choose another path.
+	choosePath(true);
 }
 
 
-/**
- * Checks the current heading and tries to correct the
- * robot's heading.
- * Returns true if it's ok, false if it can't correct it.
- */
-void correctCourse() {
 
-	if (currentMotorState != MOTOR_FORWARD) {
-		return;
-	}
-
-	// Check if we are in the right direction.
-	int roundedCurrentHeading = getCurrentRoundedHeading();
-
-	if (roundedCurrentHeading != currentDirection) {
-		nbCourseCorrectionAttempts++;
-		if (ENABLE_SERIAL_DEBUG) {
-			Serial.println("************************ correctCourse");
-			Serial.print("Correcting the course. Current is ");
-			Serial.print(roundedCurrentHeading);
-			Serial.print("Target is ");
-			Serial.println(currentDirection);
-			Serial.print("This is attempt #");
-			Serial.println(nbCourseCorrectionAttempts);
-		}
-		if (nbCourseCorrectionAttempts > COURSE_CORRECTION_NB_ATTEMPTS) {
-			// Abort. We're stuck.
-			robotBackward(2000, COURSE_CORRECTION_SPEED);
-			choosePath(true);
-		}
-		robotTurn(currentDirection, ENABLE_SERIAL_DEBUG);
-	} else {
-		nbCourseCorrectionAttempts = 0;
-	}
-}
 
 
 
