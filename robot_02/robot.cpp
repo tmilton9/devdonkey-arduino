@@ -2,6 +2,7 @@
 #include "Wire.h"
 #include "Servo.h"
 #include "math.h"
+
 //#include "WiFly.h"
 
 
@@ -91,7 +92,7 @@ const int MIN_DISTANCE_BUFFER_DIAG = 10;
  * paths and prevent it from choosing a path which might be onstructed.
  * A value of 1.3 to 1.5 is ok.
  */
-const double MIN_DISTANCE_FACTOR = 1.2;
+const double MIN_DISTANCE_FACTOR = 1.3;
 
 /**
  * Speed, between 1 and 254, at which to move forward.
@@ -111,23 +112,30 @@ const int COURSE_CORRECTION_SPEED = 100;
  * will stop trying to correct the course and back up a little,
  * then choose some other direction.
  */
-const int COURSE_CORRECTION_TIME = 1000000;
+const int COURSE_CORRECTION_TIME = 10000;
 
 /**
  * This is the number of ultranosic scan samples to use when averaging the
  * distance measurements. In order to have better accuracy, the robot always
  * does X scans in each direction and averages the results, thus reducing
  * the noise.
+ * Keep in mind that more scans take more time.
  */
-const int USENS_NBSAMPLES = 2;
+const int USENS_NBSAMPLES = 3;
 
 /**
  * This is the number of compass scan samples to use when averaging the
  * heading measurements. In order to have better accuracy, the robot always
  * does X scans, thus reducing the noise.
+ * Keep in mind that it takes 50ms per scan.
  */
-const int COMPASS_NBSAMPLES = 2;
+const int COMPASS_NBSAMPLES = 3;
 
+/**
+ * These control the servo's min and max PWM values.
+ */
+const int USERVO_LOW_PWM = 510;
+const int USERVO_HIGH_PWM = 6400;
 
 
 /**********************************************************************************/
@@ -208,7 +216,12 @@ void setup() {
 	pinMode(MOTOR_FR_POWER, OUTPUT);
 	pinMode(MOTOR_RR_POWER, OUTPUT);
 
-	uSensorServo.attach(USERVO);
+	// Position the servo to his start position
+	uSensorServo.attach(USERVO, USERVO_LOW_PWM, USERVO_HIGH_PWM);
+	uSensorServo.write(0);
+	uServoPosition = 0;
+
+	// Setup the ultrasonic sensors
 	pinMode(USENSOR1, INPUT);
 	pinMode(USENSOR2, INPUT);
 
@@ -225,20 +238,17 @@ void setup() {
 	// Update the orientation
 	updateRobotOrientation();
 
-	// Position the servo to his start position
-	uSensorServo.write(0);
-	uServoPosition = 0;
-	delay(500);
-
 	// Init HTTP comms
 //	SpiSerial.begin();
 //	delay(5000);
 //	server.begin();
 
+	// Do a full scan of the environment
 	for (int i = 0; i < 4; i++) {
 		updateRanges();
 	}
 
+	// Choose a default path.
 	choosePath(false);
 }
 
@@ -327,13 +337,13 @@ void updateRanges() {
 
 	// If the robot is going forward, we scan:
 	// front, front left and front right.
-	int targetServoOffset;
+	int targetServoPosition;
 	int currentRoundedHeading = getCurrentRoundedHeading();
 	if (currentMotorState == MOTOR_FORWARD) {
 		// Position the servo
 		if (uServoPosition > 90) {
 			// put in front
-			targetServoOffset = -(uServoPosition - 90);
+			targetServoPosition = 90;
 		} else if (uServoPosition == 90) {
 			int leftDiag = currentRoundedHeading - 45;
 			if (leftDiag < 0) {
@@ -348,56 +358,45 @@ void updateRanges() {
 
 			// A third of the time, look the other way anyways.
 			int iSecret = rand() % 10;
-			if (iSecret <=2) {
+			if (iSecret <=4) {
 				if (leftDist >= rightDist) {
-					targetServoOffset = 45;
+					targetServoPosition = 135;
 				} else {
-					targetServoOffset = -45;
+					targetServoPosition = 45;
 				}
 			} else {
 				if (leftDist <= rightDist) {
-					targetServoOffset = 45;
+					targetServoPosition = 45;
 				} else {
-					targetServoOffset = -45;
+					targetServoPosition = 135;
 				}
 			}
 		} else {
 			// put in front
-			targetServoOffset = 45;
+			targetServoPosition = 90;
 		}
 	} else {
 		// Position the servo
-		if (uServoPosition < 135) {
-			targetServoOffset = 45;
+		if (uServoPosition == 135) {
+			targetServoPosition = 0;
 		} else {
-			targetServoOffset = -135;
+			targetServoPosition = uServoPosition + 45;
 		}
 	}
 	if (ENABLE_SERIAL_DEBUG) {
 		Serial.println("************************ updateRanges");
 		Serial.print("Current servo position is:");
 		Serial.println(uServoPosition);
-		Serial.print("Ofsetting by:");
-		Serial.println(targetServoOffset);
+		Serial.print("Setting servo to:");
+		Serial.println(targetServoPosition);
 	}
 
-	if (targetServoOffset > 0) {
-		for(int pos = uServoPosition; pos < uServoPosition + targetServoOffset; pos += 5)
-		{
-			uSensorServo.write(pos);
-			delay(30);
-		}
-		uServoPosition += targetServoOffset;
-		delay(100);
-	} else {
-		for(int pos = uServoPosition; pos > uServoPosition + targetServoOffset; pos -= 5)
-		{
-			uSensorServo.write(pos);
-			delay(30);
-		}
-		uServoPosition += targetServoOffset;
-		delay(100);
-	}
+	const int servoDelay =
+		(abs(uServoPosition - targetServoPosition) / 45) * 250;
+
+	uSensorServo.write(targetServoPosition);
+	delay(servoDelay);
+	uServoPosition = targetServoPosition;
 
 	if (ENABLE_SERIAL_DEBUG) {
 		Serial.println("************************ updateRanges");
@@ -463,7 +462,7 @@ void updateRanges() {
 	 */
 	long pingSum = 0;
 	int avgPing = 0;
-	if (currentMotorState != MOTOR_FORWARD) {
+//	if (currentMotorState != MOTOR_FORWARD) {
 		// read
 	//	for (int i = 0; i < USENS_NBSAMPLES; i++) {
 	//		pingSum += analogRead(USENSOR1);
@@ -478,7 +477,7 @@ void updateRanges() {
 
 		// write
 		updateSingleRange(sensor1Heading, avgPing);
-	}
+//	}
 
 
 	/*
@@ -776,7 +775,6 @@ void robotTurn() {
 			analogWrite(MOTOR_FR_POWER, COURSE_CORRECTION_SPEED);
 			analogWrite(MOTOR_RR_POWER, COURSE_CORRECTION_SPEED);
 			currentMotorState = MOTOR_LEFT;
-			delay(500);
 		}
 	} else {
 		if (currentMotorState != MOTOR_RIGHT) {
@@ -796,7 +794,6 @@ void robotTurn() {
 			analogWrite(MOTOR_FR_POWER, COURSE_CORRECTION_SPEED);
 			analogWrite(MOTOR_RR_POWER, COURSE_CORRECTION_SPEED);
 			currentMotorState = MOTOR_RIGHT;
-			delay(500);
 		}
 	}
 }
@@ -811,7 +808,6 @@ int getCurrentRoundedHeading() {
 	}
 	return roundedCurrentHeading;
 }
-
 
 
 /**
@@ -849,9 +845,14 @@ void robotMove() {
  */
 void choosePath(bool forceNew) {
 
-	// The best choice is either full ahead, diag left or diag right.
+	// The best choice is either full ahead, diag left or diag right,
+	// assuming the way is clear. (See the rules below)
 	int bestChoice = -1;
 	int bestChoiceValue = 999;
+
+	// The second best choice is whereever there is space to go.
+	int secondBestChoice = -1;
+	int secondBestChoiceValue = -1;
 
 	for (int i = 0; i < 360; i += 45) {
 		if (forceNew && currentDirection == i) {
@@ -875,6 +876,10 @@ void choosePath(bool forceNew) {
 		int curDist = getDistanceForHeading(i);
 		int curDistLeft = getDistanceForHeading(curLeft);
 		int curDistRight = getDistanceForHeading(curRight);
+
+		if (curDist > secondBestChoiceValue) {
+			secondBestChoice = i;
+		}
 
 		if (curDist >= (MIN_DISTANCE_BUFFER * MIN_DISTANCE_FACTOR)
 			&& curDistLeft >= (MIN_DISTANCE_BUFFER_DIAG * MIN_DISTANCE_FACTOR)
@@ -917,12 +922,7 @@ void choosePath(bool forceNew) {
 	if (bestChoice >= 0) {
 		currentDirection = bestChoice;
 	} else {
-		// This is a problem. It can happen when all directions are
-		// perceived as having an obstacle. Just move backward.... whatever.
-		currentDirection += 180;
-		if (currentDirection >= 360) {
-			currentDirection -= 360;
-		}
+		currentDirection = secondBestChoice;
 	}
 }
 
@@ -949,7 +949,12 @@ void preventColisions() {
 			Serial.println("Changing course. Collision detected ahead.");
 		}
 
-		robotBackupAndChooseAnotherPath();
+		robotBackward(500, COURSE_CORRECTION_SPEED);
+		for (int i = 0; i < 2; i++) {
+			updateRanges();
+		}
+		choosePath(true);
+		robotTurn();
 
 		// We can leave early.
 		return;
@@ -973,6 +978,9 @@ void preventColisions() {
 			Serial.println("Changing course. Collision detected ahead.");
 		}
 		robotBackward(500, COURSE_CORRECTION_SPEED);
+		for (int i = 0; i < 2; i++) {
+			updateRanges();
+		}
 		choosePath(true);
 		robotTurn();
 	}
