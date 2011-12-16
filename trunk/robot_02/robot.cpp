@@ -91,7 +91,7 @@ const int MIN_DISTANCE_BUFFER_DIAG = 10;
  * paths and prevent it from choosing a path which might be onstructed.
  * A value of 1.3 to 1.5 is ok.
  */
-const double MIN_DISTANCE_FACTOR = 1.5;
+const double MIN_DISTANCE_FACTOR = 1.2;
 
 /**
  * Speed, between 1 and 254, at which to move forward.
@@ -111,7 +111,7 @@ const int COURSE_CORRECTION_SPEED = 100;
  * will stop trying to correct the course and back up a little,
  * then choose some other direction.
  */
-const int COURSE_CORRECTION_TIME = 20000;
+const int COURSE_CORRECTION_TIME = 1000000;
 
 /**
  * This is the number of ultranosic scan samples to use when averaging the
@@ -119,14 +119,14 @@ const int COURSE_CORRECTION_TIME = 20000;
  * does X scans in each direction and averages the results, thus reducing
  * the noise.
  */
-const int USENS_NBSAMPLES = 5;
+const int USENS_NBSAMPLES = 2;
 
 /**
  * This is the number of compass scan samples to use when averaging the
  * heading measurements. In order to have better accuracy, the robot always
  * does X scans, thus reducing the noise.
  */
-const int COMPASS_NBSAMPLES = 3;
+const int COMPASS_NBSAMPLES = 2;
 
 
 
@@ -458,24 +458,27 @@ void updateRanges() {
 	}
 
 	/*
-	 * Sensor 1
+	 * Sensor 1. Not needed to update when going
+	 * forward.
 	 */
-
-	// read
 	long pingSum = 0;
-//	for (int i = 0; i < USENS_NBSAMPLES; i++) {
-//		pingSum += analogRead(USENSOR1);
-//		delay(1);
-//	}
-//	int avgPing = pingSum / USENS_NBSAMPLES;
-	for (int i = 0; i < USENS_NBSAMPLES; i++) {
-		pingSum += pulseIn(USENSOR1, HIGH);
+	int avgPing = 0;
+	if (currentMotorState != MOTOR_FORWARD) {
+		// read
+	//	for (int i = 0; i < USENS_NBSAMPLES; i++) {
+	//		pingSum += analogRead(USENSOR1);
+	//		delay(1);
+	//	}
+	//	int avgPing = pingSum / USENS_NBSAMPLES;
+		for (int i = 0; i < USENS_NBSAMPLES; i++) {
+			pingSum += pulseIn(USENSOR1, HIGH);
+		}
+		avgPing = pingSum / USENS_NBSAMPLES / 147;
+
+
+		// write
+		updateSingleRange(sensor1Heading, avgPing);
 	}
-	int avgPing = pingSum / USENS_NBSAMPLES / 147;
-
-
-	// write
-	updateSingleRange(sensor1Heading, avgPing);
 
 
 	/*
@@ -773,6 +776,7 @@ void robotTurn() {
 			analogWrite(MOTOR_FR_POWER, COURSE_CORRECTION_SPEED);
 			analogWrite(MOTOR_RR_POWER, COURSE_CORRECTION_SPEED);
 			currentMotorState = MOTOR_LEFT;
+			delay(500);
 		}
 	} else {
 		if (currentMotorState != MOTOR_RIGHT) {
@@ -792,6 +796,7 @@ void robotTurn() {
 			analogWrite(MOTOR_FR_POWER, COURSE_CORRECTION_SPEED);
 			analogWrite(MOTOR_RR_POWER, COURSE_CORRECTION_SPEED);
 			currentMotorState = MOTOR_RIGHT;
+			delay(500);
 		}
 	}
 }
@@ -849,20 +854,20 @@ void choosePath(bool forceNew) {
 	int bestChoiceValue = 999;
 
 	for (int i = 0; i < 360; i += 45) {
+		if (forceNew && currentDirection == i) {
+			continue;
+		}
+
 		int turnDiff = currentDirection - i;
 		if (turnDiff < 0) {
 			turnDiff = i - currentDirection;
 		}
 
-		if (forceNew && turnDiff <= 90) {
-			continue;
-		}
-
-		int curLeft = currentDirection - 45;
+		int curLeft = i - 45;
 		if (curLeft < 0) {
 			curLeft += 360;
 		}
-		int curRight = currentDirection + 45;
+		int curRight = i + 45;
 		if (curRight >= 360) {
 			curRight -= 360;
 		}
@@ -878,6 +883,24 @@ void choosePath(bool forceNew) {
 			if (turnDiff < bestChoiceValue) {
 				bestChoiceValue = turnDiff;
 				bestChoice = i;
+			}
+		} else {
+			if (ENABLE_SERIAL_DEBUG) {
+				Serial.println("************************ choosePath");
+				Serial.print("Rejecting option ");
+				Serial.println(i);
+				Serial.print("Distance ahead: ");
+				Serial.println(curDist);
+				Serial.print("Distance left: ");
+				Serial.println(curDistLeft);
+				Serial.print("Distance left: ");
+				Serial.println(curDistRight);
+				Serial.print("Turn difference: ");
+				Serial.println(turnDiff);
+				Serial.print("Best heading: ");
+				Serial.println(bestChoice);
+				Serial.print("Best heading turn difference: ");
+				Serial.println(bestChoiceValue);
 			}
 		}
 	}
@@ -945,7 +968,13 @@ void preventColisions() {
 	if (getDistanceForHeading(leftDiag) <= MIN_DISTANCE_BUFFER_DIAG
 			|| getDistanceForHeading(rightDiag) <= MIN_DISTANCE_BUFFER_DIAG)
 	{
-		robotBackupAndChooseAnotherPath();
+		if (ENABLE_SERIAL_DEBUG) {
+			Serial.println("************************ movepreventColisions");
+			Serial.println("Changing course. Collision detected ahead.");
+		}
+		robotBackward(500, COURSE_CORRECTION_SPEED);
+		choosePath(true);
+		robotTurn();
 	}
 }
 
